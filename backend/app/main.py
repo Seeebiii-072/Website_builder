@@ -17,7 +17,8 @@ app = FastAPI(title="AI Website Builder API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.frontend_url, "http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=[settings.frontend_url, "http://localhost:3000", "http://127.0.0.1:3000","https://frontend-liart-pi-89.vercel.app",
+        "https://websitebuilder-production-fa9a.up.railway.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

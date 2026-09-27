@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -15,6 +16,10 @@ logger = logging.getLogger("build")
 
 
 def _npm_executable() -> str:
+    """
+    Find npm executable on both Linux and Windows.
+    """
+
     npm = shutil.which("npm")
     if npm:
         return npm
@@ -28,14 +33,74 @@ def _npm_executable() -> str:
     )
 
 
+def _build_environment() -> dict[str, str]:
+    """
+    Environment used for npm install/build.
+
+    Railway currently has a 1 GB RAM limit, so Node's heap is
+    intentionally capped to leave memory available for the OS,
+    FastAPI and other processes.
+    """
+
+    return {
+        **os.environ,
+        "CI": "true",
+        "NEXT_TELEMETRY_DISABLED": "1",
+        "NODE_OPTIONS": "--max-old-space-size=700",
+    }
+
+
+def _is_out_of_memory(
+    exit_code: int | None,
+    log: str,
+) -> bool:
+    """
+    Detect Linux/container/Node memory failures.
+
+    Exit code 137 normally means the process was killed by SIGKILL,
+    which in this environment is most likely an OOM kill.
+    """
+
+    if exit_code == 137:
+        return True
+
+    if not log:
+        return False
+
+    indicators = [
+        "killed",
+        "out of memory",
+        "javascript heap out of memory",
+        "heap out of memory",
+        "javaScript heap out of memory",
+        "enomem",
+        "cannot allocate memory",
+        "memory cgroup out of memory",
+    ]
+
+    log_lower = log.lower()
+
+    return any(
+        indicator.lower() in log_lower
+        for indicator in indicators
+    )
+
+
 async def _run_subprocess(
     cmd: list[str],
     cwd: str,
     timeout: int = 300,
 ) -> tuple[int, str]:
 
-    logger.info("Running command: %s", " ".join(cmd))
-    logger.info("Working directory: %s", cwd)
+    logger.info(
+        "Running command: %s",
+        " ".join(cmd),
+    )
+
+    logger.info(
+        "Working directory: %s",
+        cwd,
+    )
 
     def run():
         try:
@@ -49,11 +114,7 @@ async def _run_subprocess(
                 errors="replace",
                 timeout=timeout,
                 shell=False,
-                env={
-                    **__import__("os").environ,
-                    "CI": "true",
-                    "NEXT_TELEMETRY_DISABLED": "1",
-                },
+                env=_build_environment(),
             )
 
             return result.returncode, result.stdout
@@ -62,7 +123,10 @@ async def _run_subprocess(
             output = exc.stdout or ""
 
             if isinstance(output, bytes):
-                output = output.decode("utf-8", errors="replace")
+                output = output.decode(
+                    "utf-8",
+                    errors="replace",
+                )
 
             return -1, (
                 f"Process timed out after {timeout} seconds.\n"
@@ -70,7 +134,9 @@ async def _run_subprocess(
             )
 
         except Exception as exc:
-            return -1, f"{type(exc).__name__}: {exc}"
+            return -1, (
+                f"{type(exc).__name__}: {exc}"
+            )
 
     code, output = await asyncio.to_thread(run)
 
@@ -83,16 +149,28 @@ async def _run_subprocess(
     return code, output
 
 
-async def install_dependencies(workspace: Path) -> tuple[bool, str]:
+async def install_dependencies(
+    workspace: Path,
+) -> tuple[bool, str]:
+
     npm = _npm_executable()
 
     package_json = workspace / "package.json"
 
     if not package_json.exists():
-        return False, "package.json not found in generated project"
+        return (
+            False,
+            "package.json not found in generated project",
+        )
 
-    logger.info("Installing dependencies...")
-    logger.info("Workspace: %s", workspace)
+    logger.info(
+        "Installing dependencies..."
+    )
+
+    logger.info(
+        "Workspace: %s",
+        workspace,
+    )
 
     code, output = await _run_subprocess(
         [
@@ -109,10 +187,15 @@ async def install_dependencies(workspace: Path) -> tuple[bool, str]:
     return code == 0, output
 
 
-async def run_build(workspace: Path) -> tuple[bool, str]:
+async def run_build(
+    workspace: Path,
+) -> tuple[bool, str, int]:
+
     npm = _npm_executable()
 
-    logger.info("Starting Next.js production build...")
+    logger.info(
+        "Starting Next.js production build..."
+    )
 
     code, output = await _run_subprocess(
         [
@@ -124,7 +207,7 @@ async def run_build(workspace: Path) -> tuple[bool, str]:
         timeout=300,
     )
 
-    return code == 0, output
+    return code == 0, output, code
 
 
 async def build_with_autofix(
@@ -132,7 +215,9 @@ async def build_with_autofix(
     project: Project,
 ) -> bool:
 
-    workspace = Path(project.workspace_path)
+    workspace = Path(
+        project.workspace_path
+    )
 
     logger.info(
         "Starting build pipeline for project=%s workspace=%s",
@@ -162,12 +247,16 @@ async def build_with_autofix(
     session.commit()
 
     # ---------------------------------------------------------
-    # STEP 1: npm install
+    # STEP 1: INSTALL DEPENDENCIES
     # ---------------------------------------------------------
 
-    logger.info("STEP 1/2: Installing dependencies")
+    logger.info(
+        "STEP 1/2: Installing dependencies"
+    )
 
-    ok, install_log = await install_dependencies(workspace)
+    ok, install_log = await install_dependencies(
+        workspace
+    )
 
     if not ok:
 
@@ -200,10 +289,12 @@ async def build_with_autofix(
 
         return False
 
-    logger.info("STEP 1/2: npm install completed successfully")
+    logger.info(
+        "STEP 1/2: npm install completed successfully"
+    )
 
     # ---------------------------------------------------------
-    # STEP 2: Build + auto-fix
+    # STEP 2: BUILD + AUTO FIX
     # ---------------------------------------------------------
 
     attempt = 0
@@ -224,9 +315,15 @@ async def build_with_autofix(
         session.add(build_row)
         session.commit()
 
-        ok, log = await run_build(workspace)
+        ok, log, exit_code = await run_build(
+            workspace
+        )
 
         last_log = log
+
+        # -----------------------------------------------------
+        # BUILD SUCCESS
+        # -----------------------------------------------------
 
         if ok:
 
@@ -254,13 +351,82 @@ async def build_with_autofix(
                 },
             )
 
+            project_service.set_status(
+                session,
+                project,
+                ProjectStatus.READY,
+            )
+
             return True
 
+        # -----------------------------------------------------
+        # BUILD FAILURE
+        # -----------------------------------------------------
+
         logger.error(
-            "Build FAILED attempt=%s:\n%s",
+            "Build FAILED attempt=%s exit_code=%s:\n%s",
             attempt,
+            exit_code,
             log[-8000:],
         )
+
+        is_oom = _is_out_of_memory(
+            exit_code,
+            log,
+        )
+
+        # -----------------------------------------------------
+        # OOM / MEMORY FAILURE
+        # -----------------------------------------------------
+
+        if is_oom:
+
+            logger.error(
+                "Build stopped because of memory exhaustion. "
+                "Skipping AI auto-fix."
+            )
+
+            memory_error = (
+                "Build was killed because the build environment "
+                "ran out of memory. "
+                "AI auto-fix was skipped because this is a "
+                "resource limitation, not an application-code error.\n\n"
+                f"Exit code: {exit_code}\n\n"
+                f"{log[-6000:]}"
+            )
+
+            build_row.status = BuildStatus.FAILED
+            build_row.logs = memory_error[-8000:]
+
+            session.add(build_row)
+            session.commit()
+
+            await event_bus.publish(
+                project.id,
+                "build_failed",
+                {
+                    "stage": "memory",
+                    "attempt": attempt,
+                    "exit_code": exit_code,
+                    "log": memory_error[-4000:],
+                },
+            )
+
+            project_service.set_status(
+                session,
+                project,
+                ProjectStatus.FAILED,
+                (
+                    "Build exceeded the available memory "
+                    "limit. AI auto-fix was skipped."
+                ),
+            )
+
+            return False
+
+        # -----------------------------------------------------
+        # NORMAL BUILD FAILURE
+        # -----------------------------------------------------
 
         await event_bus.publish(
             project.id,
@@ -269,10 +435,12 @@ async def build_with_autofix(
                 "stage": "build",
                 "attempt": attempt,
                 "max_attempts": settings.max_debug_attempts,
+                "exit_code": exit_code,
                 "log": log[-4000:],
             },
         )
 
+        # No attempts remaining
         if attempt >= settings.max_debug_attempts:
             break
 
@@ -313,15 +481,17 @@ async def build_with_autofix(
             break
 
         # -----------------------------------------------------
-        # Reinstall dependencies after AI modification
+        # REINSTALL AFTER AI FIX
         # -----------------------------------------------------
 
         logger.info(
             "Reinstalling dependencies after AI fix..."
         )
 
-        ok_install, install_log2 = await install_dependencies(
-            workspace
+        ok_install, install_log2 = (
+            await install_dependencies(
+                workspace
+            )
         )
 
         if not ok_install:
@@ -336,7 +506,7 @@ async def build_with_autofix(
             break
 
     # ---------------------------------------------------------
-    # FINAL FAILURE
+    # PERMANENT BUILD FAILURE
     # ---------------------------------------------------------
 
     logger.error(
@@ -354,8 +524,10 @@ async def build_with_autofix(
         session,
         project,
         ProjectStatus.FAILED,
-        f"Build failed after {attempt} attempt(s). "
-        f"See build logs for details.",
+        (
+            f"Build failed after {attempt} attempt(s). "
+            f"See build logs for details."
+        ),
     )
 
     return False

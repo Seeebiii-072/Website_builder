@@ -16,9 +16,7 @@ logger = logging.getLogger("build")
 
 
 def _npm_executable() -> str:
-    """
-    Find npm executable on both Linux and Windows.
-    """
+    """Find npm executable on Linux and Windows."""
 
     npm = shutil.which("npm")
     if npm:
@@ -35,18 +33,22 @@ def _npm_executable() -> str:
 
 def _build_environment() -> dict[str, str]:
     """
-    Environment used for npm install/build.
+    Environment for generated Next.js projects.
 
-    Railway currently has a 1 GB RAM limit, so Node's heap is
-    intentionally capped to leave memory available for the OS,
-    FastAPI and other processes.
+    Railway container has approximately 1 GB RAM, so Node heap is
+    intentionally limited to leave memory for FastAPI and the OS.
     """
 
     return {
         **os.environ,
         "CI": "true",
         "NEXT_TELEMETRY_DISABLED": "1",
-        "NODE_OPTIONS": "--max-old-space-size=700",
+
+        # Keep Node heap below the Railway 1 GB container limit.
+        "NODE_OPTIONS": "--max-old-space-size=512",
+
+        # Reduce Next.js build concurrency.
+        "NEXT_PRIVATE_BUILD_WORKER": "1",
     }
 
 
@@ -54,12 +56,7 @@ def _is_out_of_memory(
     exit_code: int | None,
     log: str,
 ) -> bool:
-    """
-    Detect Linux/container/Node memory failures.
-
-    Exit code 137 normally means the process was killed by SIGKILL,
-    which in this environment is most likely an OOM kill.
-    """
+    """Detect container/Node memory failures."""
 
     if exit_code == 137:
         return True
@@ -72,7 +69,6 @@ def _is_out_of_memory(
         "out of memory",
         "javascript heap out of memory",
         "heap out of memory",
-        "javaScript heap out of memory",
         "enomem",
         "cannot allocate memory",
         "memory cgroup out of memory",
@@ -81,7 +77,7 @@ def _is_out_of_memory(
     log_lower = log.lower()
 
     return any(
-        indicator.lower() in log_lower
+        indicator in log_lower
         for indicator in indicators
     )
 
@@ -143,7 +139,7 @@ async def _run_subprocess(
     logger.info(
         "Command finished: exit_code=%s output_tail=%s",
         code,
-        output[-2000:],
+        output[-3000:],
     )
 
     return code, output
@@ -246,9 +242,9 @@ async def build_with_autofix(
     session.add(build_row)
     session.commit()
 
-    # ---------------------------------------------------------
+    # =========================================================
     # STEP 1: INSTALL DEPENDENCIES
-    # ---------------------------------------------------------
+    # =========================================================
 
     logger.info(
         "STEP 1/2: Installing dependencies"
@@ -293,9 +289,9 @@ async def build_with_autofix(
         "STEP 1/2: npm install completed successfully"
     )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # STEP 2: BUILD + AUTO FIX
-    # ---------------------------------------------------------
+    # =========================================================
 
     attempt = 0
     last_log = ""
@@ -321,9 +317,9 @@ async def build_with_autofix(
 
         last_log = log
 
-        # -----------------------------------------------------
-        # BUILD SUCCESS
-        # -----------------------------------------------------
+        # =====================================================
+        # SUCCESS
+        # =====================================================
 
         if ok:
 
@@ -359,9 +355,9 @@ async def build_with_autofix(
 
             return True
 
-        # -----------------------------------------------------
-        # BUILD FAILURE
-        # -----------------------------------------------------
+        # =====================================================
+        # FAILURE
+        # =====================================================
 
         logger.error(
             "Build FAILED attempt=%s exit_code=%s:\n%s",
@@ -375,9 +371,9 @@ async def build_with_autofix(
             log,
         )
 
-        # -----------------------------------------------------
-        # OOM / MEMORY FAILURE
-        # -----------------------------------------------------
+        # =====================================================
+        # MEMORY FAILURE
+        # =====================================================
 
         if is_oom:
 
@@ -388,9 +384,10 @@ async def build_with_autofix(
 
             memory_error = (
                 "Build was killed because the build environment "
-                "ran out of memory. "
+                "ran out of memory.\n\n"
                 "AI auto-fix was skipped because this is a "
-                "resource limitation, not an application-code error.\n\n"
+                "resource limitation rather than an application "
+                "code error.\n\n"
                 f"Exit code: {exit_code}\n\n"
                 f"{log[-6000:]}"
             )
@@ -424,9 +421,9 @@ async def build_with_autofix(
 
             return False
 
-        # -----------------------------------------------------
-        # NORMAL BUILD FAILURE
-        # -----------------------------------------------------
+        # =====================================================
+        # NORMAL BUILD ERROR
+        # =====================================================
 
         await event_bus.publish(
             project.id,
@@ -440,13 +437,12 @@ async def build_with_autofix(
             },
         )
 
-        # No attempts remaining
         if attempt >= settings.max_debug_attempts:
             break
 
-        # -----------------------------------------------------
-        # AI AUTO FIX
-        # -----------------------------------------------------
+        # =====================================================
+        # AI AUTO-FIX
+        # =====================================================
 
         try:
 
@@ -480,9 +476,9 @@ async def build_with_autofix(
 
             break
 
-        # -----------------------------------------------------
+        # =====================================================
         # REINSTALL AFTER AI FIX
-        # -----------------------------------------------------
+        # =====================================================
 
         logger.info(
             "Reinstalling dependencies after AI fix..."
@@ -505,9 +501,9 @@ async def build_with_autofix(
 
             break
 
-    # ---------------------------------------------------------
-    # PERMANENT BUILD FAILURE
-    # ---------------------------------------------------------
+    # =========================================================
+    # PERMANENT FAILURE
+    # =========================================================
 
     logger.error(
         "Build permanently failed after %s attempt(s)",

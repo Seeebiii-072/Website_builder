@@ -24,54 +24,55 @@ GENERATE_PROMPT_TEMPLATE = """Build a complete website for this request:
 IMPORTANT BUILD AND RESOURCE CONSTRAINTS:
 
 1. Generate a lightweight, production-ready Next.js application.
-2. The application will be built inside a Linux container with only 1 GB RAM.
-3. Keep the project simple and efficient so `npm install` and `npm run build`
-   can complete within a low-memory environment.
+2. The application will be built inside a Linux container with approximately
+   1 GB RAM.
+3. The generated project MUST be optimized for low-memory builds.
 4. Keep package.json dependencies minimal.
-5. ONLY add a dependency if the generated code actually imports and uses it.
-6. Prefer built-in React, Next.js, semantic HTML, CSS, and existing Tailwind
-   utilities over external libraries.
-7. DO NOT add heavy libraries such as:
+5. ONLY add a dependency when the generated code actually imports and uses it.
+6. Prefer built-in React, Next.js, semantic HTML, CSS and Tailwind utilities.
+7. Avoid unnecessary third-party libraries.
+8. Do NOT add heavy libraries such as:
    - framer-motion
    - large charting libraries
    - carousel/slider libraries
    - large state-management libraries
    - unnecessary UI component libraries
    - unnecessary icon packages
-   - animation libraries
-   - large utility packages
+   - unnecessary animation libraries
    unless the user's request explicitly requires them.
-8. Do not add unnecessary API routes, databases, SDKs, server-side data
-   fetching, or external services for a static website.
-9. Prefer static content and server-renderable components whenever possible.
-10. Avoid generating large datasets, huge JSON files, large inline SVGs,
-    unnecessary images, or duplicated content.
-11. Keep the number of pages and components reasonable for the user's request.
-12. Do not generate unnecessary files.
-13. Use a simple and valid Next.js App Router structure.
-14. Keep package versions mutually compatible.
-15. Do not add custom webpack configuration unless absolutely necessary.
-16. Do not add build plugins unless they are required by the application.
-17. Avoid unnecessary TypeScript complexity.
-18. Make sure all imports point to files that actually exist.
-19. Make sure all referenced assets exist or use safe remote/image URLs.
-20. The final project must be able to run:
+9. Do not add unnecessary API routes, databases, SDKs or server-side services
+   for a static website.
+10. Prefer static content and server-renderable components.
+11. Avoid large generated datasets.
+12. Avoid huge inline SVG files.
+13. Avoid duplicated content.
+14. Keep pages and components reasonably small.
+15. Do not generate unnecessary files.
+16. Use a simple Next.js App Router architecture.
+17. Do not add custom webpack configuration.
+18. Do not add unnecessary build plugins.
+19. Keep package versions mutually compatible.
+20. Do NOT intentionally use known vulnerable/deprecated Next.js versions.
+21. Do NOT use Next.js 14.1.0.
+22. Use a patched stable Next.js version compatible with the selected React
+    version.
+23. Make sure all imports point to files that actually exist.
+24. Make sure referenced assets exist or use safe remote URLs.
+25. Make sure the application can successfully run:
 
     npm install
     npm run build
 
-    inside a Linux environment with approximately 1 GB RAM.
+    inside a Linux container with approximately 1 GB RAM.
 
 DESIGN REQUIREMENTS:
 
-- Create a polished, modern, responsive website.
-- Use clean component structure.
+- Create a polished modern responsive website.
+- Use clean reusable components.
 - Use accessible semantic HTML.
-- Make the UI visually appealing without relying on heavy dependencies.
-- Use CSS/Tailwind for styling rather than external UI libraries whenever possible.
-- Ensure mobile responsiveness.
-- Do not sacrifice the requested design, but implement it using lightweight
-  technologies.
+- Use CSS/Tailwind instead of heavy UI libraries whenever possible.
+- Make the website mobile responsive.
+- Keep the design visually rich while keeping implementation lightweight.
 
 OUTPUT REQUIREMENT:
 
@@ -98,15 +99,19 @@ IMPORTANT:
 - Return ONLY files that need to be created or modified.
 - Do not return unchanged files.
 - Keep dependencies minimal.
-- Do NOT introduce heavy libraries unless the user's requested feature
-  genuinely requires one.
-- Prefer existing dependencies and existing components.
-- Prefer React/Next.js/CSS/Tailwind solutions over adding packages.
-- Do not add unnecessary API routes, databases, SDKs, or build plugins.
+- Do NOT introduce heavy libraries unless the requested feature genuinely
+  requires one.
+- Prefer existing dependencies and components.
+- Prefer React, Next.js, CSS and Tailwind solutions.
+- Do not add unnecessary API routes, databases, SDKs or build plugins.
+- Do not introduce vulnerable or deprecated framework versions.
+- Do not downgrade the existing Next.js version.
 - Make sure every new import resolves correctly.
 - Make sure the project remains compatible with:
+
     npm install
     npm run build
+
 - Keep the project suitable for a Linux container with approximately 1 GB RAM.
 
 Return a JSON object with a "files" array containing ONLY the files that need
@@ -131,23 +136,25 @@ Build error output:
 
 IMPORTANT BUILD-FIX RULES:
 
-1. First identify the actual cause of the build failure.
+1. Identify the actual cause of the build failure first.
 2. Fix ONLY the files responsible for the reported problem.
 3. Do not rewrite the entire project unnecessarily.
 4. Do not introduce new dependencies unless absolutely required.
-5. Prefer fixing the existing code using the current dependencies.
-6. Keep the project lightweight and compatible with a 1 GB RAM build
-   environment.
-7. Do not add heavy libraries just to solve a simple issue.
+5. Prefer fixing existing code using existing dependencies.
+6. Keep the project lightweight.
+7. Do not add heavy libraries to solve simple issues.
 8. Do not modify unrelated files.
-9. Ensure every import resolves correctly.
-10. Ensure the final project can run:
-       npm install
-       npm run build
+9. Do not downgrade Next.js.
+10. Do not introduce known vulnerable/deprecated Next.js versions.
+11. Make sure every import resolves correctly.
+12. Ensure the final project can run:
+
+    npm install
+    npm run build
 
 RESOURCE LIMIT RULE:
 
-If the build output contains any of the following:
+If the build output contains:
 
 - "Killed"
 - exit code 137
@@ -155,9 +162,9 @@ If the build output contains any of the following:
 - "JavaScript heap out of memory"
 - "heap out of memory"
 - "ENOMEM"
+- "cannot allocate memory"
 
-treat this primarily as a resource/memory limitation rather than an
-application-code error.
+treat it primarily as a resource/memory limitation.
 
 In that situation:
 
@@ -165,15 +172,22 @@ In that situation:
 - Do NOT add dependencies.
 - Do NOT add heavy libraries.
 - Do NOT generate large files.
-- Only make a change if there is a clear, minimal configuration/code reason
-  that can directly reduce build memory usage.
+- Do NOT make speculative application changes.
+
+Only make a change if there is a clear, minimal configuration/code change
+that directly reduces build resource usage.
 
 Return a JSON object with a "files" array containing ONLY the corrected files
 (full new content, not diffs) needed to fix this build error.
 """
 
 
-def create_project(session: Session, name: str, prompt: str) -> Project:
+def create_project(
+    session: Session,
+    name: str,
+    prompt: str,
+) -> Project:
+
     project = Project(
         name=name,
         prompt=prompt,
@@ -186,7 +200,10 @@ def create_project(session: Session, name: str, prompt: str) -> Project:
     session.refresh(project)
 
     workspace = settings.projects_path / project.id
-    workspace.mkdir(parents=True, exist_ok=True)
+    workspace.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     project.workspace_path = str(workspace)
 
@@ -197,8 +214,15 @@ def create_project(session: Session, name: str, prompt: str) -> Project:
     return project
 
 
-def get_project(session: Session, project_id: str) -> Project | None:
-    return session.get(Project, project_id)
+def get_project(
+    session: Session,
+    project_id: str,
+) -> Project | None:
+
+    return session.get(
+        Project,
+        project_id,
+    )
 
 
 def set_status(
@@ -207,6 +231,7 @@ def set_status(
     status: str,
     error_message: str | None = None,
 ):
+
     project.status = status
     project.error_message = error_message
 
@@ -234,13 +259,17 @@ async def generate_website(
     )
 
     user_prompt = GENERATE_PROMPT_TEMPLATE.format(
-        prompt=project.prompt
+        prompt=project.prompt,
     )
 
     try:
-        payload, provider = await llm.generate_json(user_prompt)
+
+        payload, provider = await llm.generate_json(
+            user_prompt,
+        )
 
     except llm.LLMAllProvidersFailedError as e:
+
         msg = f"AI generation failed. {e}"
 
         set_status(
@@ -253,12 +282,15 @@ async def generate_website(
         await event_bus.publish(
             project.id,
             "generation_failed",
-            {"error": msg},
+            {
+                "error": msg,
+            },
         )
 
         raise
 
     except ValueError as e:
+
         msg = f"AI generation failed: {e}"
 
         set_status(
@@ -271,16 +303,24 @@ async def generate_website(
         await event_bus.publish(
             project.id,
             "generation_failed",
-            {"error": msg},
+            {
+                "error": msg,
+            },
         )
 
         raise
 
     try:
-        files = validate_files_payload(payload)
+
+        files = validate_files_payload(
+            payload,
+        )
 
     except InvalidGenerationError as e:
-        msg = f"AI returned an invalid project structure: {e}"
+
+        msg = (
+            f"AI returned an invalid project structure: {e}"
+        )
 
         set_status(
             session,
@@ -292,12 +332,16 @@ async def generate_website(
         await event_bus.publish(
             project.id,
             "generation_failed",
-            {"error": msg},
+            {
+                "error": msg,
+            },
         )
 
         raise
 
-    workspace = Path(project.workspace_path)
+    workspace = Path(
+        project.workspace_path,
+    )
 
     written = write_files(
         workspace,
@@ -321,7 +365,7 @@ async def edit_website(
     project: Project,
     message: str,
 ):
-    """AI edit workflow: load context, ask LLM for changed files."""
+    """AI edit workflow."""
 
     await event_bus.publish(
         project.id,
@@ -331,10 +375,12 @@ async def edit_website(
         },
     )
 
-    workspace = Path(project.workspace_path)
+    workspace = Path(
+        project.workspace_path,
+    )
 
     context_files = read_all_files_for_context(
-        workspace
+        workspace,
     )
 
     files_context = "\n\n".join(
@@ -348,8 +394,9 @@ async def edit_website(
     )
 
     try:
+
         payload, provider = await llm.generate_json(
-            user_prompt
+            user_prompt,
         )
 
     except (
@@ -370,13 +417,16 @@ async def edit_website(
         raise
 
     try:
+
         files = validate_files_payload(
-            payload
+            payload,
         )
 
     except InvalidGenerationError as e:
 
-        msg = f"AI edit returned an invalid file set: {e}"
+        msg = (
+            f"AI edit returned an invalid file set: {e}"
+        )
 
         await event_bus.publish(
             project.id,
@@ -421,10 +471,12 @@ async def fix_build_error(
         },
     )
 
-    workspace = Path(project.workspace_path)
+    workspace = Path(
+        project.workspace_path,
+    )
 
     context_files = read_all_files_for_context(
-        workspace
+        workspace,
     )
 
     files_context = "\n\n".join(
@@ -439,11 +491,11 @@ async def fix_build_error(
     )
 
     payload, provider = await llm.generate_json(
-        user_prompt
+        user_prompt,
     )
 
     files = validate_files_payload(
-        payload
+        payload,
     )
 
     written = write_files(

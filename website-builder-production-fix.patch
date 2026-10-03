@@ -1,0 +1,993 @@
+From d2bdc8a782d2ee7ef0f6078ace7e62d26d6d5030 Mon Sep 17 00:00:00 2001
+From: fix <fix@example.com>
+Date: Sat, 3 Oct 2026 10:26:50 +0000
+Subject: [PATCH] Make live preview work in production: proxy-served next
+ start, basePath, build fixes, project page
+
+---
+ .gitignore                          |   8 +-
+ backend/app/api/preview.py          | 156 +++-----------
+ backend/app/core/config.py          |  16 ++
+ backend/app/main.py                 |   7 +-
+ backend/app/services/build.py       |  81 ++++++--
+ backend/app/services/preview.py     | 312 ++++++----------------------
+ frontend/app/projects/[id]/page.tsx | 127 +++++++++++
+ 7 files changed, 311 insertions(+), 396 deletions(-)
+ create mode 100644 frontend/app/projects/[id]/page.tsx
+
+diff --git a/.gitignore b/.gitignore
+index f587d81..3f24613 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -41,10 +41,10 @@ pnpm-debug.log*
+ Thumbs.db
+ 
+ # Generated project data
+-workspaces/
+-workspace/
+-generated/
+-projects/
++/workspaces/
++/workspace/
++/generated/
++/projects/
+ tmp/
+ temp/
+ 
+diff --git a/backend/app/api/preview.py b/backend/app/api/preview.py
+index 30527ed..7b73393 100644
+--- a/backend/app/api/preview.py
++++ b/backend/app/api/preview.py
+@@ -103,122 +103,55 @@ def get_preview(
+ # ============================================================
+ # PREVIEW PROXY
+ # ============================================================
++# Generated sites are built with basePath=/api/projects/{id}/preview/view, so
++# the upstream `next start` server expects that exact prefix on every path.
+ 
+-async def _proxy_preview(
+-    project_id: str,
+-    request: Request,
+-    session: Session,
+-    path: str = "",
+-):
+-    """
+-    Proxy requests from the browser to the generated
+-    Next.js preview server running internally on Railway.
+-
+-    Browser:
+-        /api/projects/{id}/preview/view
++_HOP_BY_HOP = {"content-length", "content-encoding", "transfer-encoding", "connection", "keep-alive"}
++_FORWARD_REQUEST_HEADERS = ("accept", "accept-language", "cache-control", "user-agent", "content-type", "range")
+ 
+-    Backend:
+-        http://127.0.0.1:{preview_port}
+-    """
+-
+-    row = preview_service.get_preview(
+-        session,
+-        project_id,
+-    )
+-
+-    if row is None:
+-        raise HTTPException(
+-            status_code=404,
+-            detail="No preview found for this project",
+-        )
+ 
+-    if not row.port:
+-        raise HTTPException(
+-            status_code=409,
+-            detail="Preview does not have a port",
+-        )
++async def _proxy_preview(project_id: str, request: Request, session: Session, path: str = ""):
++    project = project_service.get_project(session, project_id)
++    if project is None:
++        raise HTTPException(status_code=404, detail="Project not found")
+ 
++    # After a Railway redeploy/restart child processes are gone: start on demand.
+     if not preview_service.is_preview_running(project_id):
+-        raise HTTPException(
+-            status_code=409,
+-            detail="Preview server is not running",
+-        )
++        row = await preview_service.start_preview(session, project)
++        if row.status != "RUNNING":
++            raise HTTPException(status_code=409, detail=row.error_message or "Preview server is not running")
+ 
+-    # Internal Railway URL.
+-    target_url = f"http://127.0.0.1:{row.port}"
++    row = preview_service.get_preview(session, project_id)
++    if row is None or not row.port:
++        raise HTTPException(status_code=409, detail="Preview does not have a port")
+ 
++    target_url = f"http://127.0.0.1:{row.port}/api/projects/{project_id}/preview/view"
++    # NB: root must have NO trailing slash - Next 308-redirects "/base/" to "/base".
+     if path:
+         target_url += f"/{path}"
++    if request.url.query:
++        target_url += f"?{request.url.query}"
+ 
+-    # Preserve query parameters.
+-    query_string = request.url.query
+-
+-    if query_string:
+-        target_url += f"?{query_string}"
+-
+-    # Forward safe request headers.
+-    headers = {}
+-
+-    for header_name in (
+-        "accept",
+-        "accept-language",
+-        "cache-control",
+-        "user-agent",
+-    ):
+-        value = request.headers.get(header_name)
+-
+-        if value:
+-            headers[header_name] = value
++    headers = {h: request.headers[h] for h in _FORWARD_REQUEST_HEADERS if request.headers.get(h)}
+ 
+     try:
+         async with httpx.AsyncClient(
+-            timeout=httpx.Timeout(
+-                connect=5.0,
+-                read=60.0,
+-                write=30.0,
+-                pool=5.0,
+-            ),
++            timeout=httpx.Timeout(connect=5.0, read=60.0, write=30.0, pool=5.0),
+             follow_redirects=False,
+         ) as client:
+-
+             upstream = await client.request(
+-                method=request.method,
+-                url=target_url,
+-                headers=headers,
++                method=request.method, url=target_url, headers=headers, content=await request.body()
+             )
+-
+     except httpx.ConnectError:
+-        raise HTTPException(
+-            status_code=502,
+-            detail="Preview server is not reachable",
+-        )
+-
++        raise HTTPException(status_code=502, detail="Preview server is not reachable")
+     except httpx.TimeoutException:
+-        raise HTTPException(
+-            status_code=504,
+-            detail="Preview server timed out",
+-        )
+-
++        raise HTTPException(status_code=504, detail="Preview server timed out")
+     except httpx.HTTPError as exc:
+-        raise HTTPException(
+-            status_code=502,
+-            detail=f"Preview proxy error: {exc}",
+-        )
++        raise HTTPException(status_code=502, detail=f"Preview proxy error: {exc}")
+ 
+-    # Don't forward hop-by-hop headers.
+-    excluded_headers = {
+-        "content-length",
+-        "content-encoding",
+-        "transfer-encoding",
+-        "connection",
+-        "keep-alive",
+-    }
+-
+-    response_headers = {}
+-
+-    for key, value in upstream.headers.items():
+-        if key.lower() not in excluded_headers:
+-            response_headers[key] = value
++    response_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in _HOP_BY_HOP}
++    # Must be embeddable in the Vercel frontend's iframe.
++    response_headers.pop("x-frame-options", None)
+ 
+     return Response(
+         content=upstream.content,
+@@ -228,35 +161,14 @@ async def _proxy_preview(
+     )
+ 
+ 
+-# Main preview page
+-@router.get("/{project_id}/preview/view")
+-async def preview_view(
+-    project_id: str,
+-    request: Request,
+-    session: Session = Depends(get_session),
+-):
+-    return await _proxy_preview(
+-        project_id=project_id,
+-        request=request,
+-        session=session,
+-        path="",
+-    )
++@router.api_route("/{project_id}/preview/view", methods=["GET", "HEAD", "POST"])
++async def preview_view(project_id: str, request: Request, session: Session = Depends(get_session)):
++    return await _proxy_preview(project_id, request, session, path="")
+ 
+ 
+-# Next.js assets / files
+-@router.get("/{project_id}/preview/view/{path:path}")
+-async def preview_view_path(
+-    project_id: str,
+-    path: str,
+-    request: Request,
+-    session: Session = Depends(get_session),
+-):
+-    return await _proxy_preview(
+-        project_id=project_id,
+-        request=request,
+-        session=session,
+-        path=path,
+-    )
++@router.api_route("/{project_id}/preview/view/{path:path}", methods=["GET", "HEAD", "POST"])
++async def preview_view_path(project_id: str, path: str, request: Request, session: Session = Depends(get_session)):
++    return await _proxy_preview(project_id, request, session, path=path)
+ 
+ 
+ @router.get("/{project_id}/events")
+diff --git a/backend/app/core/config.py b/backend/app/core/config.py
+index 2fbbe72..b7a6ed8 100644
+--- a/backend/app/core/config.py
++++ b/backend/app/core/config.py
+@@ -23,6 +23,14 @@ class Settings(BaseSettings):
+ 
+     frontend_url: str = "http://localhost:3000"
+ 
++    # Public https URL of THIS backend (used to build browser-reachable preview
++    # URLs). Falls back to https://$RAILWAY_PUBLIC_DOMAIN when unset.
++    public_backend_url: str = ""
++    railway_public_domain: str = ""
++
++    # Timeout (seconds) for `npm install` / `npm run build` in generated projects.
++    build_timeout_seconds: int = 600
++
+     preview_start_port: int = 3001
+     preview_max_port: int = 3100
+ 
+@@ -35,6 +43,14 @@ class Settings(BaseSettings):
+         env_file = ".env"
+         protected_namespaces = ("settings_",)
+ 
++    @property
++    def backend_public_base(self) -> str:
++        if self.public_backend_url:
++            return self.public_backend_url.rstrip("/")
++        if self.railway_public_domain:
++            return f"https://{self.railway_public_domain}"
++        return "http://127.0.0.1:8000"
++
+     @property
+     def projects_path(self) -> Path:
+         p = Path(self.projects_dir).resolve()
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 1764fa4..dafc289 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -12,12 +12,17 @@ import sys
+ if sys.platform == "win32":
+     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+ logging.basicConfig(level=logging.INFO)
++# httpx logs full request URLs, which include the Gemini API key in the query string.
++logging.getLogger("httpx").setLevel(logging.WARNING)
++logging.getLogger("httpcore").setLevel(logging.WARNING)
+ 
+ app = FastAPI(title="AI Website Builder API")
+ 
+ app.add_middleware(
+     CORSMiddleware,
+-    allow_origins=[settings.frontend_url, "https://ai-website-builderfrontend.vercel.app","http://localhost:3000", "http://127.0.0.1:3000"],
++    allow_origins=[o.strip().rstrip("/") for o in settings.frontend_url.split(",") if o.strip()]
++    + ["https://ai-website-builderfrontend.vercel.app"],
++    allow_origin_regex=r"https://ai-website-builderfrontend-[a-z0-9-]+\.vercel\.app",
+     allow_credentials=True,
+     allow_methods=["*"],
+     allow_headers=["*"],
+diff --git a/backend/app/services/build.py b/backend/app/services/build.py
+index 183024f..4aed785 100644
+--- a/backend/app/services/build.py
++++ b/backend/app/services/build.py
+@@ -1,4 +1,6 @@
+ import asyncio
++import hashlib
++import json
+ import logging
+ import os
+ import shutil
+@@ -145,6 +147,42 @@ async def _run_subprocess(
+     return code, output
+ 
+ 
++def preview_base_path(project_id: str) -> str:
++    """URL prefix under which the backend proxies this project's preview."""
++    return f"/api/projects/{project_id}/preview/view"
++
++
++def ensure_next_config(workspace: Path, project_id: str) -> None:
++    """
++    Force a production-safe Next.js config into the generated project:
++      - basePath so the site (and its /_next assets) work behind the backend proxy
++      - skip lint/type checking (the step that hung builds on a small container)
++      - unoptimized images (no sharp/image optimizer memory use)
++    """
++    for name in ("next.config.mjs", "next.config.ts", "next.config.cjs"):
++        f = workspace / name
++        if f.exists():
++            f.unlink()
++
++    config = (
++        "/** @type {import('next').NextConfig} */\n"
++        "const nextConfig = {\n"
++        f"  basePath: {json.dumps(preview_base_path(project_id))},\n"
++        "  eslint: { ignoreDuringBuilds: true },\n"
++        "  typescript: { ignoreBuildErrors: true },\n"
++        "  images: { unoptimized: true },\n"
++        "  productionBrowserSourceMaps: false,\n"
++        "};\n"
++        "module.exports = nextConfig;\n"
++    )
++    (workspace / "next.config.js").write_text(config, encoding="utf-8")
++
++
++def _package_hash(workspace: Path) -> str:
++    pkg = workspace / "package.json"
++    return hashlib.sha256(pkg.read_bytes()).hexdigest() if pkg.exists() else ""
++
++
+ async def install_dependencies(
+     workspace: Path,
+ ) -> tuple[bool, str]:
+@@ -177,7 +215,7 @@ async def install_dependencies(
+             "--prefer-offline",
+         ],
+         cwd=str(workspace),
+-        timeout=300,
++        timeout=settings.build_timeout_seconds,
+     )
+ 
+     return code == 0, output
+@@ -200,7 +238,7 @@ async def run_build(
+             "build",
+         ],
+         cwd=str(workspace),
+-        timeout=300,
++        timeout=settings.build_timeout_seconds,
+     )
+ 
+     return code == 0, output, code
+@@ -242,6 +280,8 @@ async def build_with_autofix(
+     session.add(build_row)
+     session.commit()
+ 
++    ensure_next_config(workspace, project.id)
++
+     # =========================================================
+     # STEP 1: INSTALL DEPENDENCIES
+     # =========================================================
+@@ -451,6 +491,8 @@ async def build_with_autofix(
+                 attempt,
+             )
+ 
++            pkg_before = _package_hash(workspace)
++
+             await project_service.fix_build_error(
+                 session,
+                 project,
+@@ -458,6 +500,9 @@ async def build_with_autofix(
+                 attempt,
+             )
+ 
++            ensure_next_config(workspace, project.id)
++            deps_changed = _package_hash(workspace) != pkg_before
++
+         except Exception as e:
+ 
+             logger.exception(
+@@ -477,29 +522,31 @@ async def build_with_autofix(
+             break
+ 
+         # =====================================================
+-        # REINSTALL AFTER AI FIX
++        # REINSTALL ONLY IF THE AI CHANGED package.json
+         # =====================================================
+ 
+-        logger.info(
+-            "Reinstalling dependencies after AI fix..."
+-        )
++        if deps_changed:
+ 
+-        ok_install, install_log2 = (
+-            await install_dependencies(
+-                workspace
++            logger.info(
++                "package.json changed after AI fix; reinstalling..."
+             )
+-        )
+ 
+-        if not ok_install:
++            ok_install, install_log2 = (
++                await install_dependencies(
++                    workspace
++                )
++            )
+ 
+-            last_log = install_log2
++            if not ok_install:
+ 
+-            logger.error(
+-                "Dependency reinstall failed:\n%s",
+-                install_log2[-8000:],
+-            )
++                last_log = install_log2
+ 
+-            break
++                logger.error(
++                    "Dependency reinstall failed:\n%s",
++                    install_log2[-8000:],
++                )
++
++                break
+ 
+     # =========================================================
+     # PERMANENT FAILURE
+diff --git a/backend/app/services/preview.py b/backend/app/services/preview.py
+index 49d7d76..3ef90df 100644
+--- a/backend/app/services/preview.py
++++ b/backend/app/services/preview.py
+@@ -1,12 +1,12 @@
+ import asyncio
+ import logging
++import os
+ import shutil
+ import socket
+-import sys
++import subprocess
+ from pathlib import Path
+ from typing import Optional
+-import os
+-import subprocess
++
+ import httpx
+ from sqlmodel import Session
+ 
+@@ -14,22 +14,13 @@ from app.core.config import settings
+ from app.core.events import event_bus
+ from app.models.models import Project, Preview, PreviewStatus, ProjectStatus
+ from app.services import project as project_service
++from app.services.build import preview_base_path
+ 
+ logger = logging.getLogger("preview")
+ 
+ # In-memory registry of live subprocess handles, keyed by project_id.
+-# (Process objects can't be stored in SQLite; only pid/port/status/url go there.)
+-_RUNNING_PROCESSES: dict[str, asyncio.subprocess.Process] = {}
+-
+-
+-def _npm_executable() -> str:
+-    npm = shutil.which("npm")
+-    if npm:
+-        return npm
+-    npm_cmd = shutil.which("npm.cmd")
+-    if npm_cmd:
+-        return npm_cmd
+-    raise RuntimeError("npm was not found on PATH. Install Node.js/npm to run previews.")
++# (Process objects can't be stored in the DB; only pid/port/status/url go there.)
++_RUNNING_PROCESSES: dict[str, subprocess.Popen] = {}
+ 
+ 
+ def _port_is_free(port: int) -> bool:
+@@ -51,6 +42,11 @@ def find_available_port() -> int:
+     )
+ 
+ 
++def public_preview_url(project_id: str) -> str:
++    """Browser-reachable URL: served through this backend's proxy route."""
++    return f"{settings.backend_public_base}{preview_base_path(project_id)}/"
++
++
+ def _get_or_create_preview_row(session: Session, project_id: str) -> Preview:
+     row = session.get(Preview, project_id)
+     if row is None:
+@@ -61,10 +57,12 @@ def _get_or_create_preview_row(session: Session, project_id: str) -> Preview:
+     return row
+ 
+ 
+-async def _wait_until_responsive(url: str, timeout_seconds: int = 60) -> bool:
++async def _wait_until_responsive(url: str, proc: subprocess.Popen, timeout_seconds: int = 60) -> bool:
+     deadline = asyncio.get_event_loop().time() + timeout_seconds
+-    async with httpx.AsyncClient(timeout=2) as client:
++    async with httpx.AsyncClient(timeout=3) as client:
+         while asyncio.get_event_loop().time() < deadline:
++            if proc.poll() is not None:
++                return False
+             try:
+                 resp = await client.get(url)
+                 if resp.status_code < 500:
+@@ -75,297 +73,107 @@ async def _wait_until_responsive(url: str, timeout_seconds: int = 60) -> bool:
+     return False
+ 
+ 
+-# async def start_preview(session: Session, project: Project) -> Preview:
+-#     workspace = Path(project.workspace_path)
+-#     row = _get_or_create_preview_row(session, project.id)
+-
+-#     # Stop any existing process for this project first (restart semantics)
+-#     await stop_preview(session, project.id)
+-
+-#     port = find_available_port()
+-#     row.status = PreviewStatus.STARTING
+-#     row.port = port
+-#     row.pid = None
+-#     row.url = None
+-#     row.error_message = None
+-#     session.add(row)
+-#     session.commit()
+-#     await event_bus.publish(project.id, "preview_starting", {"port": port})
+-
+-#     npm = _npm_executable()
+-#     cmd = [npm, "run", "dev", "--", "--port", str(port), "--hostname", "127.0.0.1"]
+-
+-#     try:
+-#         proc = await asyncio.create_subprocess_exec(
+-#             *cmd,
+-#             cwd=str(workspace),
+-#             stdout=asyncio.subprocess.PIPE,
+-#             stderr=asyncio.subprocess.STDOUT,
+-#         )
+-#     except OSError as e:
+-#         row.status = PreviewStatus.FAILED
+-#         row.error_message = f"Failed to start dev server: {e}"
+-#         session.add(row)
+-#         session.commit()
+-#         await event_bus.publish(project.id, "preview_failed", {"error": row.error_message})
+-#         return row
+-
+-#     _RUNNING_PROCESSES[project.id] = proc
+-#     row.pid = proc.pid
+-#     session.add(row)
+-#     session.commit()
+-
+-#     url = f"http://127.0.0.1:{port}"
+-#     responsive = await _wait_until_responsive(url, timeout_seconds=90)
+-
+-#     if not responsive or proc.returncode is not None:
+-#         row.status = PreviewStatus.FAILED
+-#         row.error_message = "Preview server did not become responsive in time"
+-#         session.add(row)
+-#         session.commit()
+-#         await event_bus.publish(project.id, "preview_failed", {"error": row.error_message})
+-#         return row
+-
+-#     row.status = PreviewStatus.RUNNING
+-#     row.url = url
+-#     session.add(row)
+-#     session.commit()
+-#     await event_bus.publish(project.id, "preview_ready", {"url": url})
+-
+-#     # project is only "READY" once a live preview is actually confirmed
+-#     project_service.set_status(session, project, ProjectStatus.READY)
+-#     return row
++async def _fail(session: Session, row: Preview, project_id: str, message: str) -> Preview:
++    row.status = PreviewStatus.FAILED
++    row.error_message = message
++    session.add(row)
++    session.commit()
++    await event_bus.publish(project_id, "preview_failed", {"error": message})
++    return row
++
++
+ async def start_preview(session: Session, project: Project) -> Preview:
++    """
++    Serve the already-built production bundle with `next start`.
++    (`next dev` recompiles on demand and needs far more RAM/CPU; the build
++    step has already produced .next/, so `next start` is fast and light.)
++    """
+     workspace = Path(project.workspace_path)
+     row = _get_or_create_preview_row(session, project.id)
+ 
+-    # Stop any existing process for this project first (restart semantics)
+     await stop_preview(session, project.id)
+ 
+-    port = find_available_port()
++    if not (workspace / ".next").exists():
++        return await _fail(session, row, project.id, "No production build found (.next missing). Build the project first.")
+ 
++    next_bin = workspace / "node_modules" / ".bin" / "next"
++    if not next_bin.exists():
++        return await _fail(session, row, project.id, "next binary not found in node_modules. Run npm install first.")
++
++    port = find_available_port()
+     row.status = PreviewStatus.STARTING
+     row.port = port
+     row.pid = None
+     row.url = None
+     row.error_message = None
+-
+     session.add(row)
+     session.commit()
++    await event_bus.publish(project.id, "preview_starting", {"port": port})
+ 
+-    await event_bus.publish(
+-        project.id,
+-        "preview_starting",
+-        {"port": port},
+-    )
+-
+-    npm = _npm_executable()
+-
+-    cmd = [
+-        npm,
+-        "run",
+-        "dev",
+-        "--",
+-        "--port",
+-        str(port),
+-        "--hostname",
+-        "127.0.0.1",
+-    ]
++    env = {**os.environ, "NODE_ENV": "production", "NEXT_TELEMETRY_DISABLED": "1",
++           "NODE_OPTIONS": "--max-old-space-size=256"}
++    cmd = [str(next_bin), "start", "--port", str(port), "--hostname", "127.0.0.1"]
+ 
+     try:
+-        # Windows-safe subprocess startup.
+-        # asyncio.create_subprocess_exec() can raise
+-        # NotImplementedError under the current Windows event loop.
+-        def start_process():
+-            return subprocess.Popen(
++        proc = await asyncio.to_thread(
++            lambda: subprocess.Popen(
+                 cmd,
+                 cwd=str(workspace),
+-                stdout=subprocess.PIPE,
+-                stderr=subprocess.STDOUT,
++                stdout=subprocess.DEVNULL,   # never block on a full pipe
++                stderr=subprocess.DEVNULL,
+                 stdin=subprocess.DEVNULL,
+-                text=True,
+-                encoding="utf-8",
+-                errors="replace",
+-                shell=False,
++                env=env,
+             )
+-
+-        proc = await asyncio.to_thread(start_process)
+-
+-    except OSError as e:
+-        row.status = PreviewStatus.FAILED
+-        row.error_message = f"Failed to start dev server: {e}"
+-
+-        session.add(row)
+-        session.commit()
+-
+-        await event_bus.publish(
+-            project.id,
+-            "preview_failed",
+-            {"error": row.error_message},
+-        )
+-
+-        return row
+-
+-    except Exception as e:
+-        row.status = PreviewStatus.FAILED
+-        row.error_message = (
+-            f"Unexpected error while starting preview: "
+-            f"{type(e).__name__}: {e}"
+         )
+-
+-        session.add(row)
+-        session.commit()
+-
+-        await event_bus.publish(
+-            project.id,
+-            "preview_failed",
+-            {"error": row.error_message},
+-        )
+-
+-        return row
++    except Exception as e:  # noqa: BLE001
++        return await _fail(session, row, project.id, f"Failed to start preview server: {type(e).__name__}: {e}")
+ 
+     _RUNNING_PROCESSES[project.id] = proc
+-
+     row.pid = proc.pid
+-
+     session.add(row)
+     session.commit()
+ 
+-    url = f"http://127.0.0.1:{port}"
+-
+-    responsive = await _wait_until_responsive(
+-        url,
+-        timeout_seconds=90,
+-    )
+-
+-    if not responsive:
+-        row.status = PreviewStatus.FAILED
+-        row.error_message = (
+-            "Preview server did not become responsive in time"
+-        )
+-
+-        # Clean up the process if it failed to become responsive.
++    local_url = f"http://127.0.0.1:{port}{preview_base_path(project.id)}"
++    if not await _wait_until_responsive(local_url, proc, timeout_seconds=60):
+         try:
+             if proc.poll() is None:
+                 proc.terminate()
+-        except Exception:
++        except Exception:  # noqa: BLE001
+             pass
+-
+         _RUNNING_PROCESSES.pop(project.id, None)
++        return await _fail(session, row, project.id, "Preview server did not become responsive in time")
+ 
+-        session.add(row)
+-        session.commit()
+-
+-        await event_bus.publish(
+-            project.id,
+-            "preview_failed",
+-            {"error": row.error_message},
+-        )
+-
+-        return row
+-
+-    # Check process status AFTER responsiveness check.
+-    if proc.poll() is not None:
+-        row.status = PreviewStatus.FAILED
+-        row.error_message = (
+-            f"Preview server exited unexpectedly "
+-            f"with code {proc.returncode}"
+-        )
+-
+-        _RUNNING_PROCESSES.pop(project.id, None)
+-
+-        session.add(row)
+-        session.commit()
+-
+-        await event_bus.publish(
+-            project.id,
+-            "preview_failed",
+-            {"error": row.error_message},
+-        )
+-
+-        return row
+-
++    url = public_preview_url(project.id)
+     row.status = PreviewStatus.RUNNING
+     row.url = url
+-
+     session.add(row)
+     session.commit()
+-
+-    await event_bus.publish(
+-        project.id,
+-        "preview_ready",
+-        {"url": url},
+-    )
+-
+-    # Project becomes READY only after the live preview is confirmed.
+-    project_service.set_status(
+-        session,
+-        project,
+-        ProjectStatus.READY,
+-    )
+-
++    await event_bus.publish(project.id, "preview_ready", {"url": url})
++    project_service.set_status(session, project, ProjectStatus.READY)
+     return row
+ 
+ 
+-# async def stop_preview(session: Session, project_id: str) -> None:
+-#     proc = _RUNNING_PROCESSES.pop(project_id, None)
+-#     if proc is not None and proc.returncode is None:
+-#         proc.terminate()
+-#         try:
+-#             await asyncio.wait_for(proc.wait(), timeout=10)
+-#         except asyncio.TimeoutError:
+-#             proc.kill()
+-#             await proc.wait()
+-
+-#     row = session.get(Preview, project_id)
+-#     if row is not None:
+-#         row.status = PreviewStatus.STOPPED
+-#         row.pid = None
+-#         session.add(row)
+-#         session.commit()
+-#         await event_bus.publish(project_id, "preview_stopped", {})
+ async def stop_preview(session: Session, project_id: str) -> None:
+     proc = _RUNNING_PROCESSES.pop(project_id, None)
+-
+     if proc is not None and proc.poll() is None:
+         try:
+             proc.terminate()
+-
+-            # Popen.wait() is blocking, so run it in a worker thread.
+-            await asyncio.wait_for(
+-                asyncio.to_thread(proc.wait),
+-                timeout=10,
+-            )
+-
+-        except asyncio.TimeoutError:
++            await asyncio.wait_for(asyncio.to_thread(proc.wait), timeout=10)
++        except Exception:  # noqa: BLE001
+             try:
+                 proc.kill()
+-            except Exception:
+-                pass
+-
+-            await asyncio.to_thread(proc.wait)
+-
+-        except Exception:
+-            try:
+-                if proc.poll() is None:
+-                    proc.kill()
+-            except Exception:
++                await asyncio.to_thread(proc.wait)
++            except Exception:  # noqa: BLE001
+                 pass
+ 
+     row = session.get(Preview, project_id)
+-
+     if row is not None:
+         row.status = PreviewStatus.STOPPED
+         row.pid = None
+-
+         session.add(row)
+         session.commit()
++        await event_bus.publish(project_id, "preview_stopped", {})
+ 
+-        await event_bus.publish(
+-            project_id,
+-            "preview_stopped",
+-            {},
+-        )
+ 
+ async def restart_preview(session: Session, project: Project) -> Preview:
+     return await start_preview(session, project)
+@@ -377,4 +185,4 @@ def get_preview(session: Session, project_id: str) -> Optional[Preview]:
+ 
+ def is_preview_running(project_id: str) -> bool:
+     proc = _RUNNING_PROCESSES.get(project_id)
+-    return proc is not None and proc.returncode is None
++    return proc is not None and proc.poll() is None
+diff --git a/frontend/app/projects/[id]/page.tsx b/frontend/app/projects/[id]/page.tsx
+new file mode 100644
+index 0000000..680e73c
+--- /dev/null
++++ b/frontend/app/projects/[id]/page.tsx
+@@ -0,0 +1,127 @@
++'use client';
++
++import { useCallback, useEffect, useRef, useState } from 'react';
++import { useParams } from 'next/navigation';
++import { api, ProjectResponse } from '@/lib/api';
++import TopBar from '@/components/TopBar';
++import ChatPanel, { ChatMessage } from '@/components/ChatPanel';
++import PreviewPanel from '@/components/PreviewPanel';
++import FileExplorer from '@/components/FileExplorer';
++
++const EVENT_TYPES = [
++  'generation_started', 'generation_completed', 'generation_failed',
++  'build_started', 'build_completed', 'build_failed',
++  'ai_fix_started', 'ai_fix_completed', 'ai_fix_failed',
++  'ai_edit_started', 'ai_edit_completed', 'ai_edit_failed',
++  'preview_starting', 'preview_ready', 'preview_failed', 'preview_stopped',
++];
++
++function describe(type: string, data: any): { text: string; isError?: boolean } | null {
++  switch (type) {
++    case 'generation_started': return { text: 'Generating your website with AI…' };
++    case 'generation_completed': return { text: `Generated ${data?.files_written?.length ?? ''} files (${data?.provider ?? 'AI'}).` };
++    case 'generation_failed': return { text: data?.error || 'Generation failed.', isError: true };
++    case 'build_started': return { text: 'Installing dependencies and building…' };
++    case 'build_completed': return { text: 'Build succeeded.' };
++    case 'build_failed': return { text: `Build failed${data?.attempt ? ` (attempt ${data.attempt})` : ''}.\n${(data?.log || '').slice(-600)}`, isError: true };
++    case 'ai_fix_started': return { text: `AI is fixing the build error (attempt ${data?.attempt})…` };
++    case 'ai_fix_completed': return { text: 'AI applied a fix. Rebuilding…' };
++    case 'ai_fix_failed': return { text: data?.error || 'AI fix failed.', isError: true };
++    case 'ai_edit_started': return { text: 'Applying your change…' };
++    case 'ai_edit_completed': return { text: 'Change applied. Rebuilding…' };
++    case 'ai_edit_failed': return { text: data?.error || 'Edit failed.', isError: true };
++    case 'preview_starting': return { text: 'Starting live preview…' };
++    case 'preview_ready': return { text: 'Live preview is ready.' };
++    case 'preview_failed': return { text: data?.error || 'Preview failed.', isError: true };
++    default: return null;
++  }
++}
++
++export default function ProjectPage() {
++  const params = useParams<{ id: string }>();
++  const id = params.id;
++  const [project, setProject] = useState<ProjectResponse | null>(null);
++  const [messages, setMessages] = useState<ChatMessage[]>([]);
++  const [refreshKey, setRefreshKey] = useState(0);
++  const [busy, setBusy] = useState(false);
++  const seq = useRef(0);
++
++  const push = useCallback((role: ChatMessage['role'], text: string, isError?: boolean) => {
++    seq.current += 1;
++    setMessages((m) => [...m, { id: `${Date.now()}-${seq.current}`, role, text, isError }]);
++  }, []);
++
++  const refreshProject = useCallback(async () => {
++    try {
++      const p = await api.getProject(id);
++      setProject(p);
++      return p;
++    } catch (e: any) {
++      push('system', `Could not load project: ${e.message}`, true);
++      return null;
++    }
++  }, [id, push]);
++
++  // Live events (SSE). Backend replays history on connect.
++  useEffect(() => {
++    refreshProject();
++    const es = new EventSource(api.eventsUrl(id));
++    const handler = (ev: MessageEvent) => {
++      try {
++        const payload = JSON.parse(ev.data);
++        const d = describe(payload.type, payload.data);
++        if (d) push('ai', d.text, d.isError);
++        if (payload.type === 'generation_completed' || payload.type === 'ai_edit_completed' || payload.type === 'ai_fix_completed') {
++          setRefreshKey((k) => k + 1);
++        }
++        refreshProject();
++      } catch {
++        /* ignore malformed event */
++      }
++    };
++    EVENT_TYPES.forEach((t) => es.addEventListener(t, handler));
++    return () => es.close();
++  }, [id, push, refreshProject]);
++
++  // Poll as a safety net while the pipeline is running (SSE can drop on proxies).
++  useEffect(() => {
++    if (!project || !['CREATING', 'GENERATING', 'BUILDING'].includes(project.status)) return;
++    const t = setInterval(refreshProject, 4000);
++    return () => clearInterval(t);
++  }, [project, refreshProject]);
++
++  async function handleSend(text: string) {
++    push('user', text);
++    setBusy(true);
++    try {
++      await api.edit(id, text);
++    } catch (e: any) {
++      push('system', e.message || 'Edit failed', true);
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  async function handleRefresh() {
++    try {
++      if (project?.status === 'READY') await api.restartPreview(id);
++    } catch {
++      /* surfaced via events */
++    }
++    refreshProject();
++  }
++
++  const status = project?.status ?? 'CREATING';
++  const working = ['CREATING', 'GENERATING', 'BUILDING'].includes(status);
++
++  return (
++    <div className="h-screen flex flex-col">
++      <TopBar name={project?.name ?? 'Loading…'} status={status} projectId={id} />
++      <div className="flex-1 grid min-h-0" style={{ gridTemplateColumns: '320px 1fr 280px' }}>
++        <ChatPanel messages={messages} onSend={handleSend} disabled={busy || working} />
++        <PreviewPanel previewUrl={project?.preview_url ?? null} status={status} onRefresh={handleRefresh} />
++        <FileExplorer projectId={id} refreshKey={refreshKey} />
++      </div>
++    </div>
++  );
++}
+-- 
+2.43.0
